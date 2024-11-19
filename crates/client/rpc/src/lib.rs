@@ -2,6 +2,8 @@
 //!
 //! It uses the madara client and backend in order to answer queries.
 
+#![feature(iter_collect_into)]
+
 mod constants;
 mod errors;
 pub mod providers;
@@ -17,7 +19,7 @@ use std::sync::Arc;
 
 use mc_db::db_block_id::DbBlockIdResolvable;
 use mc_db::MadaraBackend;
-use mp_block::{MadaraMaybePendingBlock, MadaraMaybePendingBlockInfo};
+use mp_block::{MadaraBlock, MadaraMaybePendingBlock, MadaraMaybePendingBlockInfo};
 use mp_chain_config::{ChainConfig, RpcVersion};
 use mp_convert::ToFelt;
 
@@ -67,6 +69,10 @@ impl Starknet {
             .get_block(block_id)
             .or_internal_server_error("Error getting block from storage")?
             .ok_or(StarknetRpcApiError::BlockNotFound)
+    }
+
+    pub fn get_block_stream(&self, block_n: u64) -> StarknetRpcResult<impl Iterator<Item = MadaraBlock> + '_> {
+        self.backend.get_block_stream(block_n).map_err(|_| StarknetRpcApiError::BlockNotFound)
     }
 
     pub fn chain_id(&self) -> Felt {
