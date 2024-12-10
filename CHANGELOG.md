@@ -2,6 +2,7 @@
 
 ## Next release
 
+- dev docs: add documentation to the rocksdb configuration
 - feat: fetch eth/strk price and sync strk gas price
 - feat(block_production): continue pending block on restart
 - feat(mempool): mempool transaction saving on db
