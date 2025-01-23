@@ -1,10 +1,9 @@
 [workspace]
 members = [
-  # madara
   "crates/madara/client/db",
   "crates/madara/client/exec",
   "crates/madara/client/sync",
-  "crates/madara/client/eth",
+  "crates/madara/client/settlement_client",
   "crates/madara/client/rpc",
   "crates/madara/client/gateway/client",
   "crates/madara/client/gateway/server",
@@ -31,11 +30,10 @@ members = [
 resolver = "2"
 # Everything except test-related packages, so that they are not compiled when doing `cargo build`.
 default-members = [
-  # madara
   "crates/madara/client/db",
   "crates/madara/client/exec",
   "crates/madara/client/sync",
-  "crates/madara/client/eth",
+  "crates/madara/client/settlement_client",
   "crates/madara/client/gateway/client",
   "crates/madara/client/gateway/server",
   "crates/madara/client/rpc",
@@ -129,7 +127,7 @@ mc-rpc = { path = "crates/madara/client/rpc" }
 mc-gateway-client = { path = "crates/madara/client/gateway/client" }
 mc-gateway-server = { path = "crates/madara/client/gateway/server" }
 mc-sync = { path = "crates/madara/client/sync" }
-mc-eth = { path = "crates/madara/client/eth" }
+mc-settlement-client = { path = "crates/madara/client/settlement_client" }
 mc-mempool = { path = "crates/madara/client/mempool" }
 mc-block-production = { path = "crates/madara/client/block_production" }
 mc-block-import = { path = "crates/madara/client/block_import" }
@@ -222,6 +220,7 @@ dotenv = "0.15.0"
 httpmock = "0.7.0"
 tempfile = "3.10.1"
 mockall = "0.13.0"
+serial_test = "3.1.1"
 itertools = "0.13.0"
 regex = "1.10.5"
 bytes = "1.6.0"
