@@ -629,41 +629,90 @@ mod tests {
     use blockifier::{
         bouncer::BouncerWeights, compiled_class_hash, nonce, state::cached_state::StateMaps, storage_key,
     };
-    use mc_db::MadaraBackend;
-    use mc_mempool::Mempool;
-    use mp_block::VisitedSegments;
+    use mc_block_import::{BlockImporter, BlockValidationContext};
+    use mc_db::{db_block_id::DbBlockId, MadaraBackend};
+    use mc_devnet::{ChainGenesisDescription, DevnetKeys};
+    use mc_mempool::{Mempool, MempoolLimits, MempoolProvider, MockL1DataProvider};
+    use mp_block::{
+        header::{GasPrices, L1DataAvailabilityMode},
+        BlockId, BlockTag, VisitedSegments,
+    };
     use mp_chain_config::ChainConfig;
     use mp_convert::ToFelt;
     use mp_state_update::{
         ContractStorageDiffItem, DeclaredClassItem, DeployedContractItem, NonceUpdate, ReplacedClassItem, StateDiff,
         StorageEntry,
     };
+    use mp_transactions::{BroadcastedTransactionExt, Transaction};
     use starknet_api::{
         class_hash, contract_address,
         core::{ClassHash, ContractAddress, PatriciaKey},
         felt, patricia_key,
     };
     use starknet_types_core::felt::Felt;
+    use starknet_types_rpc::{
+        BroadcastedDeclareTxn, BroadcastedDeclareTxnV3, BroadcastedTxn, DaMode, ResourceBounds, ResourceBoundsMapping,
+    };
 
     use crate::{
         finalize_execution_state::state_map_to_state_diff, metrics::BlockProductionMetrics, BlockProductionTask,
     };
 
-    type TxFixtureInfo = (mp_transactions::Transaction, mp_receipt::TransactionReceipt);
+    type TxFixtureInfo = (Transaction, mp_receipt::TransactionReceipt);
 
     #[rstest::fixture]
     fn backend() -> Arc<MadaraBackend> {
-        MadaraBackend::open_for_testing(Arc::new(ChainConfig::madara_test()))
+        MadaraBackend::open_for_testing(Arc::new(ChainConfig::madara_devnet()))
     }
 
     #[rstest::fixture]
-    fn setup(
-        backend: Arc<MadaraBackend>,
-    ) -> (Arc<MadaraBackend>, Arc<mc_block_import::BlockImporter>, Arc<BlockProductionMetrics>) {
+    fn setup() -> (
+        Arc<MadaraBackend>,
+        Arc<BlockImporter>,
+        Arc<BlockProductionMetrics>,
+        Arc<MockL1DataProvider>,
+        Arc<Mempool>,
+        DevnetKeys,
+    ) {
+        let mut g = ChainGenesisDescription::base_config().unwrap();
+        let contracts = g.add_devnet_contracts(10).unwrap();
+
+        let chain_config = Arc::new(ChainConfig::madara_devnet());
+        let block = g.build(&chain_config).unwrap();
+        let backend = MadaraBackend::open_for_testing(Arc::clone(&chain_config));
+        let importer = Arc::new(BlockImporter::new(Arc::clone(&backend), None).unwrap());
+
+        tracing::debug!("{:?}", block.state_diff);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime
+            .block_on(
+                importer.add_block(
+                    block,
+                    BlockValidationContext::new(chain_config.chain_id.clone()).trust_class_hashes(true),
+                ),
+            )
+            .unwrap();
+
+        tracing::debug!("block imported {:?}", backend.get_block_info(&BlockId::Tag(BlockTag::Latest)));
+
+        let mut l1_data_provider = MockL1DataProvider::new();
+        l1_data_provider.expect_get_da_mode().return_const(L1DataAvailabilityMode::Blob);
+        l1_data_provider.expect_get_gas_prices().return_const(GasPrices {
+            eth_l1_gas_price: 128,
+            strk_l1_gas_price: 128,
+            eth_l1_data_gas_price: 128,
+            strk_l1_data_gas_price: 128,
+        });
+        let l1_data_provider = Arc::new(l1_data_provider);
+
         (
             Arc::clone(&backend),
             Arc::new(mc_block_import::BlockImporter::new(Arc::clone(&backend), None).unwrap()),
             Arc::new(BlockProductionMetrics::register()),
+            Arc::clone(&l1_data_provider),
+            Arc::new(Mempool::new(backend, l1_data_provider, MempoolLimits::for_testing())),
+            contracts,
         )
     }
 
@@ -919,7 +968,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_arguments)]
     async fn block_prod_pending_close_on_startup_pass(
-        setup: (Arc<MadaraBackend>, Arc<mc_block_import::BlockImporter>, Arc<BlockProductionMetrics>),
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
         #[with(Felt::ONE)] tx_invoke_v0: TxFixtureInfo,
         #[with(Felt::TWO)] tx_l1_handler: TxFixtureInfo,
         #[with(Felt::THREE)] tx_declare_v0: TxFixtureInfo,
@@ -937,7 +993,7 @@ mod tests {
         visited_segments: VisitedSegments,
         bouncer_weights: BouncerWeights,
     ) {
-        let (backend, importer, metrics) = setup;
+        let (backend, importer, metrics, _, _, _) = setup;
 
         // ================================================================== //
         //                  PART 1: we prepare the pending block              //
@@ -1087,7 +1143,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_arguments)]
     async fn block_prod_pending_close_on_startup_pass_on_top(
-        setup: (Arc<MadaraBackend>, Arc<mc_block_import::BlockImporter>, Arc<BlockProductionMetrics>),
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
 
         // Transactions
         #[from(tx_invoke_v0)]
@@ -1126,7 +1189,7 @@ mod tests {
         visited_segments: VisitedSegments,
         bouncer_weights: BouncerWeights,
     ) {
-        let (backend, importer, metrics) = setup;
+        let (backend, importer, metrics, _, _, _) = setup;
 
         // ================================================================== //
         //                   PART 1: we prepare the ready block               //
@@ -1350,9 +1413,16 @@ mod tests {
     #[rstest::rstest]
     #[tokio::test]
     async fn block_prod_pending_close_on_startup_no_pending(
-        setup: (Arc<MadaraBackend>, Arc<mc_block_import::BlockImporter>, Arc<BlockProductionMetrics>),
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
     ) {
-        let (backend, importer, metrics) = setup;
+        let (backend, importer, metrics, _, _, _) = setup;
 
         // Simulates starting block production without a pending block in db
         BlockProductionTask::<Mempool>::close_pending_block(&backend, &importer, &metrics)
@@ -1373,7 +1443,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_arguments)]
     async fn block_prod_pending_close_on_startup_no_visited_segments(
-        setup: (Arc<MadaraBackend>, Arc<mc_block_import::BlockImporter>, Arc<BlockProductionMetrics>),
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
         #[with(Felt::ONE)] tx_invoke_v0: TxFixtureInfo,
         #[with(Felt::TWO)] tx_l1_handler: TxFixtureInfo,
         #[with(Felt::THREE)] tx_declare_v0: TxFixtureInfo,
@@ -1390,7 +1467,7 @@ mod tests {
         converted_class_sierra_2: mp_class::ConvertedClass,
         bouncer_weights: BouncerWeights,
     ) {
-        let (backend, importer, metrics) = setup;
+        let (backend, importer, metrics, _, _, _) = setup;
 
         // ================================================================== //
         //                  PART 1: we prepare the pending block              //
@@ -1520,7 +1597,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_arguments)]
     async fn block_prod_pending_close_on_startup_fail_missing_class(
-        setup: (Arc<MadaraBackend>, Arc<mc_block_import::BlockImporter>, Arc<BlockProductionMetrics>),
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
         #[with(Felt::ONE)] tx_invoke_v0: TxFixtureInfo,
         #[with(Felt::TWO)] tx_l1_handler: TxFixtureInfo,
         #[with(Felt::THREE)] tx_declare_v0: TxFixtureInfo,
@@ -1529,7 +1613,7 @@ mod tests {
         visited_segments: VisitedSegments,
         bouncer_weights: BouncerWeights,
     ) {
-        let (backend, importer, metrics) = setup;
+        let (backend, importer, metrics, _, _, _) = setup;
 
         // ================================================================== //
         //                  PART 1: we prepare the pending block              //
@@ -1620,7 +1704,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_arguments)]
     async fn block_prod_pending_close_on_startup_fail_missing_class_legacy(
-        setup: (Arc<MadaraBackend>, Arc<mc_block_import::BlockImporter>, Arc<BlockProductionMetrics>),
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
         #[with(Felt::ONE)] tx_invoke_v0: TxFixtureInfo,
         #[with(Felt::TWO)] tx_l1_handler: TxFixtureInfo,
         #[with(Felt::THREE)] tx_declare_v0: TxFixtureInfo,
@@ -1629,7 +1720,7 @@ mod tests {
         visited_segments: VisitedSegments,
         bouncer_weights: BouncerWeights,
     ) {
-        let (backend, importer, metrics) = setup;
+        let (backend, importer, metrics, _, _, _) = setup;
 
         // ================================================================== //
         //                  PART 1: we prepare the pending block              //
@@ -1713,4 +1804,779 @@ mod tests {
         assert!(err.contains("Failed to retrieve pending declared class at hash"));
         assert!(err.contains("not found in db"));
     }
+
+    #[rstest::rstest]
+    fn test_on_pending_block_tick_block_still_pending(
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
+
+        // Transactions
+        #[from(tx_invoke_v0)]
+        #[with(Felt::ONE)]
+        tx_invoke_v0_1: TxFixtureInfo,
+        #[from(tx_l1_handler)]
+        #[with(Felt::TWO)]
+        tx_l1_handler_2: TxFixtureInfo,
+        #[from(tx_declare_v0)]
+        #[with(Felt::THREE)]
+        tx_declare_v0_3: TxFixtureInfo,
+        tx_deploy: TxFixtureInfo,
+        tx_deploy_account: TxFixtureInfo,
+
+        // Converted classes
+        #[from(converted_class_legacy)]
+        #[with(Felt::ZERO)]
+        converted_class_legacy_0: mp_class::ConvertedClass,
+        #[from(converted_class_sierra)]
+        #[with(Felt::ONE, Felt::ONE)]
+        converted_class_sierra_1: mp_class::ConvertedClass,
+        #[from(converted_class_sierra)]
+        #[with(Felt::TWO, Felt::TWO)]
+        converted_class_sierra_2: mp_class::ConvertedClass,
+
+        // Pending data
+        visited_segments: VisitedSegments,
+        bouncer_weights: BouncerWeights,
+    ) {
+        let (backend, importer, metrics, l1_data_provider, mempool, contracts) = setup;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // ================================================================== //
+        //             PART 1: we add a transaction to the mempool            //
+        // ================================================================== //
+
+        // The transaction itself is meaningless, it's just to check
+        // if the task correctly reads it and process it
+        let sender_address = &contracts.0[0];
+        let sierra_class: starknet_core::types::contract::SierraClass =
+            serde_json::from_slice(m_cairo_test_contracts::TEST_CONTRACT_SIERRA).unwrap();
+        let flattened_class: mp_class::FlattenedSierraClass = sierra_class.clone().flatten().unwrap().into();
+
+        // starkli class-hash target/dev/madara_contracts_TestContract.compiled_contract_class.json
+        let compiled_contract_class_hash =
+            Felt::from_hex("0x0138105ded3d2e4ea1939a0bc106fb80fd8774c9eb89c1890d4aeac88e6a1b27").unwrap();
+
+        let mut declare_txn: BroadcastedDeclareTxn<Felt> = BroadcastedDeclareTxn::V3(BroadcastedDeclareTxnV3 {
+            sender_address: sender_address.address,
+            compiled_class_hash: compiled_contract_class_hash,
+            signature: vec![],
+            nonce: Felt::ZERO,
+            contract_class: flattened_class.into(),
+            resource_bounds: ResourceBoundsMapping {
+                l1_gas: ResourceBounds { max_amount: 210000, max_price_per_unit: 10000 },
+                l2_gas: ResourceBounds { max_amount: 60000, max_price_per_unit: 10000 },
+            },
+            tip: 0,
+            paymaster_data: vec![],
+            account_deployment_data: vec![],
+            nonce_data_availability_mode: DaMode::L1,
+            fee_data_availability_mode: DaMode::L1,
+        });
+
+        let (blockifier_tx, _class) = BroadcastedTxn::Declare(declare_txn.clone())
+            .into_blockifier(backend.chain_config().chain_id.to_felt(), backend.chain_config().latest_protocol_version)
+            .unwrap();
+        let signature = sender_address.secret.sign(&mc_mempool::transaction_hash(&blockifier_tx)).unwrap();
+
+        let tx_signature = match &mut declare_txn {
+            BroadcastedDeclareTxn::V1(tx) => &mut tx.signature,
+            BroadcastedDeclareTxn::V2(tx) => &mut tx.signature,
+            BroadcastedDeclareTxn::V3(tx) => &mut tx.signature,
+            _ => unreachable!("the declare tx is not query only"),
+        };
+        *tx_signature = vec![signature.r, signature.s];
+
+        let _ = mempool.tx_accept_declare(declare_txn).unwrap();
+
+        assert!(!mempool.is_empty());
+
+        // ================================================================== //
+        //                  PART 2: we prepare the pending block              //
+        // ================================================================== //
+
+        let pending_inner = mp_block::MadaraBlockInner {
+            transactions: vec![
+                tx_invoke_v0_1.0,
+                tx_l1_handler_2.0,
+                tx_declare_v0_3.0,
+                tx_deploy.0,
+                tx_deploy_account.0,
+            ],
+            receipts: vec![tx_invoke_v0_1.1, tx_l1_handler_2.1, tx_declare_v0_3.1, tx_deploy.1, tx_deploy_account.1],
+        };
+
+        let pending_state_diff = mp_state_update::StateDiff {
+            storage_diffs: vec![
+                ContractStorageDiffItem {
+                    address: Felt::ONE,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+                ContractStorageDiffItem {
+                    address: Felt::TWO,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+                ContractStorageDiffItem {
+                    address: Felt::THREE,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+            ],
+            deprecated_declared_classes: vec![Felt::ZERO],
+            declared_classes: vec![
+                DeclaredClassItem { class_hash: Felt::ONE, compiled_class_hash: Felt::ONE },
+                DeclaredClassItem { class_hash: Felt::TWO, compiled_class_hash: Felt::TWO },
+            ],
+            deployed_contracts: vec![DeployedContractItem { address: Felt::THREE, class_hash: Felt::THREE }],
+            replaced_classes: vec![ReplacedClassItem { contract_address: Felt::TWO, class_hash: Felt::TWO }],
+            nonces: vec![
+                NonceUpdate { contract_address: Felt::ONE, nonce: Felt::ONE },
+                NonceUpdate { contract_address: Felt::TWO, nonce: Felt::TWO },
+                NonceUpdate { contract_address: Felt::THREE, nonce: Felt::THREE },
+            ],
+        };
+
+        let pending_converted_classes =
+            vec![converted_class_legacy_0.clone(), converted_class_sierra_1.clone(), converted_class_sierra_2.clone()];
+
+        // ================================================================== //
+        //                   PART 3: storing the pending block                //
+        // ================================================================== //
+
+        // We insert a pending block to check if the block was closed
+        // after execution
+        backend
+            .store_block(
+                mp_block::MadaraMaybePendingBlock {
+                    info: mp_block::MadaraMaybePendingBlockInfo::Pending(mp_block::MadaraPendingBlockInfo {
+                        header: mp_block::header::PendingHeader::default(),
+                        tx_hashes: vec![Felt::ONE, Felt::TWO, Felt::THREE],
+                    }),
+                    inner: pending_inner.clone(),
+                },
+                pending_state_diff.clone(),
+                pending_converted_classes.clone(),
+                Some(visited_segments.clone()),
+                Some(bouncer_weights),
+            )
+            .expect("Failed to store pending block");
+
+        // ================================================================== //
+        //                PART 4: run pending time tick method                //
+        // ================================================================== //
+
+        // If the program ran correctly, the pending block should
+        // have no transactions on it after the method ran for at
+        // least block_time
+
+        rt.block_on(async {
+            let mut block_production_task = BlockProductionTask::new(
+                Arc::clone(&backend),
+                importer,
+                Arc::clone(&mempool),
+                metrics,
+                l1_data_provider,
+            )
+            .await
+            .unwrap();
+            block_production_task.set_current_pending_tick(1);
+            block_production_task.on_pending_time_tick().await.unwrap();
+        });
+
+        let pending_block = backend.get_block(&DbBlockId::Pending).unwrap().unwrap();
+
+        assert!(mempool.is_empty());
+        assert_eq!(pending_block.inner.transactions.len(), 1);
+        assert_eq!(backend.get_latest_block_n().unwrap().unwrap(), 0);
+    }
+
+    #[rstest::rstest]
+    fn test_on_block_time_tick(
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
+
+        // Transactions
+        #[from(tx_invoke_v0)]
+        #[with(Felt::ONE)]
+        tx_invoke_v0_1: TxFixtureInfo,
+        #[from(tx_l1_handler)]
+        #[with(Felt::TWO)]
+        tx_l1_handler_2: TxFixtureInfo,
+        #[from(tx_declare_v0)]
+        #[with(Felt::THREE)]
+        tx_declare_v0_3: TxFixtureInfo,
+        tx_deploy: TxFixtureInfo,
+        tx_deploy_account: TxFixtureInfo,
+
+        // Converted classes
+        #[from(converted_class_legacy)]
+        #[with(Felt::ZERO)]
+        converted_class_legacy_0: mp_class::ConvertedClass,
+        #[from(converted_class_sierra)]
+        #[with(Felt::ONE, Felt::ONE)]
+        converted_class_sierra_1: mp_class::ConvertedClass,
+        #[from(converted_class_sierra)]
+        #[with(Felt::TWO, Felt::TWO)]
+        converted_class_sierra_2: mp_class::ConvertedClass,
+
+        // Pending data
+        visited_segments: VisitedSegments,
+        bouncer_weights: BouncerWeights,
+    ) {
+        let (backend, importer, metrics, l1_data_provider, mempool, contracts) = setup;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // ================================================================== //
+        //             PART 1: we add a transaction to the mempool            //
+        // ================================================================== //
+
+        // The transaction itself is meaningless, it's just to check
+        // if the task correctly reads it and process it
+        let sender_address = &contracts.0[0];
+        let sierra_class: starknet_core::types::contract::SierraClass =
+            serde_json::from_slice(m_cairo_test_contracts::TEST_CONTRACT_SIERRA).unwrap();
+        let flattened_class: mp_class::FlattenedSierraClass = sierra_class.clone().flatten().unwrap().into();
+
+        // starkli class-hash target/dev/madara_contracts_TestContract.compiled_contract_class.json
+        let compiled_contract_class_hash =
+            Felt::from_hex("0x0138105ded3d2e4ea1939a0bc106fb80fd8774c9eb89c1890d4aeac88e6a1b27").unwrap();
+
+        let mut declare_txn: BroadcastedDeclareTxn<Felt> = BroadcastedDeclareTxn::V3(BroadcastedDeclareTxnV3 {
+            sender_address: sender_address.address,
+            compiled_class_hash: compiled_contract_class_hash,
+            signature: vec![],
+            nonce: Felt::ZERO,
+            contract_class: flattened_class.into(),
+            resource_bounds: ResourceBoundsMapping {
+                l1_gas: ResourceBounds { max_amount: 210000, max_price_per_unit: 10000 },
+                l2_gas: ResourceBounds { max_amount: 60000, max_price_per_unit: 10000 },
+            },
+            tip: 0,
+            paymaster_data: vec![],
+            account_deployment_data: vec![],
+            nonce_data_availability_mode: DaMode::L1,
+            fee_data_availability_mode: DaMode::L1,
+        });
+
+        let (blockifier_tx, _class) = BroadcastedTxn::Declare(declare_txn.clone())
+            .into_blockifier(backend.chain_config().chain_id.to_felt(), backend.chain_config().latest_protocol_version)
+            .unwrap();
+        let signature = sender_address.secret.sign(&mc_mempool::transaction_hash(&blockifier_tx)).unwrap();
+
+        let tx_signature = match &mut declare_txn {
+            BroadcastedDeclareTxn::V1(tx) => &mut tx.signature,
+            BroadcastedDeclareTxn::V2(tx) => &mut tx.signature,
+            BroadcastedDeclareTxn::V3(tx) => &mut tx.signature,
+            _ => unreachable!("the declare tx is not query only"),
+        };
+        *tx_signature = vec![signature.r, signature.s];
+
+        let _ = mempool.tx_accept_declare(declare_txn).unwrap();
+
+        assert!(!mempool.is_empty());
+
+        // ================================================================== //
+        //                  PART 2: we prepare the pending block              //
+        // ================================================================== //
+
+        let pending_inner = mp_block::MadaraBlockInner {
+            transactions: vec![
+                tx_invoke_v0_1.0,
+                tx_l1_handler_2.0,
+                tx_declare_v0_3.0,
+                tx_deploy.0,
+                tx_deploy_account.0,
+            ],
+            receipts: vec![tx_invoke_v0_1.1, tx_l1_handler_2.1, tx_declare_v0_3.1, tx_deploy.1, tx_deploy_account.1],
+        };
+
+        let pending_state_diff = mp_state_update::StateDiff {
+            storage_diffs: vec![
+                ContractStorageDiffItem {
+                    address: Felt::ONE,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+                ContractStorageDiffItem {
+                    address: Felt::TWO,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+                ContractStorageDiffItem {
+                    address: Felt::THREE,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+            ],
+            deprecated_declared_classes: vec![Felt::ZERO],
+            declared_classes: vec![
+                DeclaredClassItem { class_hash: Felt::ONE, compiled_class_hash: Felt::ONE },
+                DeclaredClassItem { class_hash: Felt::TWO, compiled_class_hash: Felt::TWO },
+            ],
+            deployed_contracts: vec![DeployedContractItem { address: Felt::THREE, class_hash: Felt::THREE }],
+            replaced_classes: vec![ReplacedClassItem { contract_address: Felt::TWO, class_hash: Felt::TWO }],
+            nonces: vec![
+                NonceUpdate { contract_address: Felt::ONE, nonce: Felt::ONE },
+                NonceUpdate { contract_address: Felt::TWO, nonce: Felt::TWO },
+                NonceUpdate { contract_address: Felt::THREE, nonce: Felt::THREE },
+            ],
+        };
+
+        let pending_converted_classes =
+            vec![converted_class_legacy_0.clone(), converted_class_sierra_1.clone(), converted_class_sierra_2.clone()];
+
+        // ================================================================== //
+        //                   PART 3: storing the pending block                //
+        // ================================================================== //
+
+        // We insert a pending block to check if the block was closed
+        // after execution
+        backend
+            .store_block(
+                mp_block::MadaraMaybePendingBlock {
+                    info: mp_block::MadaraMaybePendingBlockInfo::Pending(mp_block::MadaraPendingBlockInfo {
+                        header: mp_block::header::PendingHeader::default(),
+                        tx_hashes: vec![Felt::ONE, Felt::TWO, Felt::THREE],
+                    }),
+                    inner: pending_inner.clone(),
+                },
+                pending_state_diff.clone(),
+                pending_converted_classes.clone(),
+                Some(visited_segments.clone()),
+                Some(bouncer_weights),
+            )
+            .expect("Failed to store pending block");
+
+        // ================================================================== //
+        //                    PART 4: run block time method                   //
+        // ================================================================== //
+
+        // If the program ran correctly, the pending block should
+        // have no transactions on it after the method ran for at
+        // least block_time
+
+        rt.block_on(async {
+            let mut block_production_task = BlockProductionTask::new(
+                Arc::clone(&backend),
+                importer,
+                Arc::clone(&mempool),
+                metrics,
+                l1_data_provider,
+            )
+            .await
+            .unwrap();
+            block_production_task.on_block_time().await.unwrap();
+        });
+
+        let pending_block = backend.get_block(&DbBlockId::Pending).unwrap().unwrap();
+
+        assert!(mempool.is_empty());
+        assert!(pending_block.inner.transactions.is_empty());
+        assert_eq!(backend.get_latest_block_n().unwrap().unwrap(), 1);
+    }
+
+    #[rstest::rstest]
+    fn test_start_block_production_task_normal_setup(
+        setup: (
+            Arc<MadaraBackend>,
+            Arc<mc_block_import::BlockImporter>,
+            Arc<BlockProductionMetrics>,
+            Arc<MockL1DataProvider>,
+            Arc<Mempool>,
+            DevnetKeys,
+        ),
+
+        // Transactions
+        #[from(tx_invoke_v0)]
+        #[with(Felt::ONE)]
+        tx_invoke_v0_1: TxFixtureInfo,
+        #[from(tx_l1_handler)]
+        #[with(Felt::TWO)]
+        tx_l1_handler_2: TxFixtureInfo,
+        #[from(tx_declare_v0)]
+        #[with(Felt::THREE)]
+        tx_declare_v0_3: TxFixtureInfo,
+        tx_deploy: TxFixtureInfo,
+        tx_deploy_account: TxFixtureInfo,
+
+        // Converted classes
+        #[from(converted_class_legacy)]
+        #[with(Felt::ZERO)]
+        converted_class_legacy_0: mp_class::ConvertedClass,
+        #[from(converted_class_sierra)]
+        #[with(Felt::ONE, Felt::ONE)]
+        converted_class_sierra_1: mp_class::ConvertedClass,
+        #[from(converted_class_sierra)]
+        #[with(Felt::TWO, Felt::TWO)]
+        converted_class_sierra_2: mp_class::ConvertedClass,
+
+        // Pending data
+        visited_segments: VisitedSegments,
+        bouncer_weights: BouncerWeights,
+    ) {
+        let (backend, importer, metrics, l1_data_provider, mempool, contracts) = setup;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // ================================================================== //
+        //             PART 1: we add a transaction to the mempool            //
+        // ================================================================== //
+
+        // The transaction itself is meaningless, it's just to check
+        // if the task correctly reads it and process it
+        let sender_address = &contracts.0[0];
+        let sierra_class: starknet_core::types::contract::SierraClass =
+            serde_json::from_slice(m_cairo_test_contracts::TEST_CONTRACT_SIERRA).unwrap();
+        let flattened_class: mp_class::FlattenedSierraClass = sierra_class.clone().flatten().unwrap().into();
+
+        // starkli class-hash target/dev/madara_contracts_TestContract.compiled_contract_class.json
+        let compiled_contract_class_hash =
+            Felt::from_hex("0x0138105ded3d2e4ea1939a0bc106fb80fd8774c9eb89c1890d4aeac88e6a1b27").unwrap();
+
+        let mut declare_txn: BroadcastedDeclareTxn<Felt> = BroadcastedDeclareTxn::V3(BroadcastedDeclareTxnV3 {
+            sender_address: sender_address.address,
+            compiled_class_hash: compiled_contract_class_hash,
+            signature: vec![],
+            nonce: Felt::ZERO,
+            contract_class: flattened_class.into(),
+            resource_bounds: ResourceBoundsMapping {
+                l1_gas: ResourceBounds { max_amount: 210000, max_price_per_unit: 10000 },
+                l2_gas: ResourceBounds { max_amount: 60000, max_price_per_unit: 10000 },
+            },
+            tip: 0,
+            paymaster_data: vec![],
+            account_deployment_data: vec![],
+            nonce_data_availability_mode: DaMode::L1,
+            fee_data_availability_mode: DaMode::L1,
+        });
+
+        let (blockifier_tx, _class) = BroadcastedTxn::Declare(declare_txn.clone())
+            .into_blockifier(backend.chain_config().chain_id.to_felt(), backend.chain_config().latest_protocol_version)
+            .unwrap();
+        let signature = sender_address.secret.sign(&mc_mempool::transaction_hash(&blockifier_tx)).unwrap();
+
+        let tx_signature = match &mut declare_txn {
+            BroadcastedDeclareTxn::V1(tx) => &mut tx.signature,
+            BroadcastedDeclareTxn::V2(tx) => &mut tx.signature,
+            BroadcastedDeclareTxn::V3(tx) => &mut tx.signature,
+            _ => unreachable!("the declare tx is not query only"),
+        };
+        *tx_signature = vec![signature.r, signature.s];
+
+        let _ = mempool.tx_accept_declare(declare_txn).unwrap();
+
+        assert!(!mempool.is_empty());
+
+        // ================================================================== //
+        //                  PART 2: we prepare the pending block              //
+        // ================================================================== //
+
+        let pending_inner = mp_block::MadaraBlockInner {
+            transactions: vec![
+                tx_invoke_v0_1.0,
+                tx_l1_handler_2.0,
+                tx_declare_v0_3.0,
+                tx_deploy.0,
+                tx_deploy_account.0,
+            ],
+            receipts: vec![tx_invoke_v0_1.1, tx_l1_handler_2.1, tx_declare_v0_3.1, tx_deploy.1, tx_deploy_account.1],
+        };
+
+        let pending_state_diff = mp_state_update::StateDiff {
+            storage_diffs: vec![
+                ContractStorageDiffItem {
+                    address: Felt::ONE,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+                ContractStorageDiffItem {
+                    address: Felt::TWO,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+                ContractStorageDiffItem {
+                    address: Felt::THREE,
+                    storage_entries: vec![
+                        StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+                        StorageEntry { key: Felt::ONE, value: Felt::ONE },
+                        StorageEntry { key: Felt::TWO, value: Felt::TWO },
+                    ],
+                },
+            ],
+            deprecated_declared_classes: vec![Felt::ZERO],
+            declared_classes: vec![
+                DeclaredClassItem { class_hash: Felt::ONE, compiled_class_hash: Felt::ONE },
+                DeclaredClassItem { class_hash: Felt::TWO, compiled_class_hash: Felt::TWO },
+            ],
+            deployed_contracts: vec![DeployedContractItem { address: Felt::THREE, class_hash: Felt::THREE }],
+            replaced_classes: vec![ReplacedClassItem { contract_address: Felt::TWO, class_hash: Felt::TWO }],
+            nonces: vec![
+                NonceUpdate { contract_address: Felt::ONE, nonce: Felt::ONE },
+                NonceUpdate { contract_address: Felt::TWO, nonce: Felt::TWO },
+                NonceUpdate { contract_address: Felt::THREE, nonce: Felt::THREE },
+            ],
+        };
+
+        let pending_converted_classes =
+            vec![converted_class_legacy_0.clone(), converted_class_sierra_1.clone(), converted_class_sierra_2.clone()];
+
+        // ================================================================== //
+        //                   PART 3: storing the pending block                //
+        // ================================================================== //
+
+        // We insert a pending block to check if the block was closed
+        // after execution
+        backend
+            .store_block(
+                mp_block::MadaraMaybePendingBlock {
+                    info: mp_block::MadaraMaybePendingBlockInfo::Pending(mp_block::MadaraPendingBlockInfo {
+                        header: mp_block::header::PendingHeader::default(),
+                        tx_hashes: vec![Felt::ONE, Felt::TWO, Felt::THREE],
+                    }),
+                    inner: pending_inner.clone(),
+                },
+                pending_state_diff.clone(),
+                pending_converted_classes.clone(),
+                Some(visited_segments.clone()),
+                Some(bouncer_weights),
+            )
+            .expect("Failed to store pending block");
+
+        // ================================================================== //
+        //                  PART 4: init block production task                //
+        // ================================================================== //
+
+        // If the program ran correctly, the pending block should
+        // have no transactions on it after the method ran for at
+        // least block_time
+
+        rt.block_on(async {
+            let block_production_task = BlockProductionTask::new(
+                Arc::clone(&backend),
+                importer,
+                Arc::clone(&mempool),
+                metrics,
+                l1_data_provider,
+            )
+            .await
+            .unwrap();
+
+            let task_handle = tokio::spawn(
+                block_production_task.block_production_task(mp_utils::service::ServiceContext::new_for_testing()),
+            );
+
+            // We force a timeout after the minimum execution time
+            // plus a little bit to guarantee
+            let _ = tokio::time::timeout(
+                backend.chain_config().block_time + std::time::Duration::from_secs(2),
+                task_handle,
+            )
+            .await;
+        });
+
+        let pending_block = backend.get_block(&DbBlockId::Pending).unwrap().unwrap();
+
+        assert!(mempool.is_empty());
+        assert!(pending_block.inner.transactions.is_empty());
+        assert_eq!(backend.get_latest_block_n().unwrap().unwrap(), 1);
+    }
+
+    // #[rstest::rstest]
+    // #[tokio::test]
+    // async fn test_start_block_production_task_small_block_time(
+    //     setup: (
+    //         Arc<MadaraBackend>,
+    //         Arc<mc_block_import::BlockImporter>,
+    //         Arc<BlockProductionMetrics>,
+    //         Arc<MockL1DataProvider>,
+    //         Arc<Mempool>,
+    //         DevnetKeys,
+    //     ),
+
+    //     // Transactions
+    //     #[from(tx_invoke_v0)]
+    //     #[with(Felt::ONE)]
+    //     tx_invoke_v0_1: TxFixtureInfo,
+    //     #[from(tx_l1_handler)]
+    //     #[with(Felt::TWO)]
+    //     tx_l1_handler_2: TxFixtureInfo,
+    //     #[from(tx_declare_v0)]
+    //     #[with(Felt::THREE)]
+    //     tx_declare_v0_3: TxFixtureInfo,
+    //     tx_deploy: TxFixtureInfo,
+    //     tx_deploy_account: TxFixtureInfo,
+
+    //     // Converted classes
+    //     #[from(converted_class_legacy)]
+    //     #[with(Felt::ZERO)]
+    //     converted_class_legacy_0: mp_class::ConvertedClass,
+    //     #[from(converted_class_sierra)]
+    //     #[with(Felt::ONE, Felt::ONE)]
+    //     converted_class_sierra_1: mp_class::ConvertedClass,
+    //     #[from(converted_class_sierra)]
+    //     #[with(Felt::TWO, Felt::TWO)]
+    //     converted_class_sierra_2: mp_class::ConvertedClass,
+
+    //     // Pending data
+    //     visited_segments: VisitedSegments,
+    //     bouncer_weights: BouncerWeights,
+    // ) {
+    //     let (_, importer, metrics, l1_data_provider, mempool, _) = setup;
+
+    //     // ================================================================== //
+    //     //                    PART 1: we prepare the backend                  //
+    //     // ================================================================== //
+
+    //     // For this test, we change the backend to have different block
+    //     // and pending block times to see how the task reacts
+    //     let backend = MadaraBackend::open_for_testing(Arc::new(ChainConfig {
+    //         block_time: std::time::Duration::from_micros(500),
+    //         pending_block_update_time: std::time::Duration::from_secs(2),
+    //         ..ChainConfig::madara_test()
+    //     }));
+
+    //     // ================================================================== //
+    //     //                  PART 2: we prepare the pending block              //
+    //     // ================================================================== //
+
+    //     let pending_inner = mp_block::MadaraBlockInner {
+    //         transactions: vec![
+    //             tx_invoke_v0_1.0,
+    //             tx_l1_handler_2.0,
+    //             tx_declare_v0_3.0,
+    //             tx_deploy.0,
+    //             tx_deploy_account.0,
+    //         ],
+    //         receipts: vec![tx_invoke_v0_1.1, tx_l1_handler_2.1, tx_declare_v0_3.1, tx_deploy.1, tx_deploy_account.1],
+    //     };
+
+    //     let pending_state_diff = mp_state_update::StateDiff {
+    //         storage_diffs: vec![
+    //             ContractStorageDiffItem {
+    //                 address: Felt::ONE,
+    //                 storage_entries: vec![
+    //                     StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+    //                     StorageEntry { key: Felt::ONE, value: Felt::ONE },
+    //                     StorageEntry { key: Felt::TWO, value: Felt::TWO },
+    //                 ],
+    //             },
+    //             ContractStorageDiffItem {
+    //                 address: Felt::TWO,
+    //                 storage_entries: vec![
+    //                     StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+    //                     StorageEntry { key: Felt::ONE, value: Felt::ONE },
+    //                     StorageEntry { key: Felt::TWO, value: Felt::TWO },
+    //                 ],
+    //             },
+    //             ContractStorageDiffItem {
+    //                 address: Felt::THREE,
+    //                 storage_entries: vec![
+    //                     StorageEntry { key: Felt::ZERO, value: Felt::ZERO },
+    //                     StorageEntry { key: Felt::ONE, value: Felt::ONE },
+    //                     StorageEntry { key: Felt::TWO, value: Felt::TWO },
+    //                 ],
+    //             },
+    //         ],
+    //         deprecated_declared_classes: vec![Felt::ZERO],
+    //         declared_classes: vec![
+    //             DeclaredClassItem { class_hash: Felt::ONE, compiled_class_hash: Felt::ONE },
+    //             DeclaredClassItem { class_hash: Felt::TWO, compiled_class_hash: Felt::TWO },
+    //         ],
+    //         deployed_contracts: vec![DeployedContractItem { address: Felt::THREE, class_hash: Felt::THREE }],
+    //         replaced_classes: vec![ReplacedClassItem { contract_address: Felt::TWO, class_hash: Felt::TWO }],
+    //         nonces: vec![
+    //             NonceUpdate { contract_address: Felt::ONE, nonce: Felt::ONE },
+    //             NonceUpdate { contract_address: Felt::TWO, nonce: Felt::TWO },
+    //             NonceUpdate { contract_address: Felt::THREE, nonce: Felt::THREE },
+    //         ],
+    //     };
+
+    //     let pending_converted_classes =
+    //         vec![converted_class_legacy_0.clone(), converted_class_sierra_1.clone(), converted_class_sierra_2.clone()];
+
+    //     // ================================================================== //
+    //     //                   PART 3: storing the pending block                //
+    //     // ================================================================== //
+
+    //     // We insert a pending block to check if the block was closed
+    //     // after execution
+    //     backend
+    //         .store_block(
+    //             mp_block::MadaraMaybePendingBlock {
+    //                 info: mp_block::MadaraMaybePendingBlockInfo::Pending(mp_block::MadaraPendingBlockInfo {
+    //                     header: mp_block::header::PendingHeader::default(),
+    //                     tx_hashes: vec![Felt::ONE, Felt::TWO, Felt::THREE],
+    //                 }),
+    //                 inner: pending_inner.clone(),
+    //             },
+    //             pending_state_diff.clone(),
+    //             pending_converted_classes.clone(),
+    //             Some(visited_segments.clone()),
+    //             Some(bouncer_weights),
+    //         )
+    //         .expect("Failed to store pending block");
+
+    //     // ================================================================== //
+    //     //                  PART 4: init block production task                //
+    //     // ================================================================== //
+
+    //     // If the program ran correctly, the pending block should
+    //     // have no transactions on it after the method ran for at
+    //     // least block_time
+
+    //     let block_production_task =
+    //         BlockProductionTask::new(Arc::clone(&backend), importer, Arc::clone(&mempool), metrics, l1_data_provider)
+    //             .await
+    //             .unwrap();
+
+    //     let task_handle = tokio::spawn(
+    //         block_production_task.block_production_task(mp_utils::service::ServiceContext::new_for_testing()),
+    //     );
+
+    //     // We force a timeout after the minimum execution time
+    //     let _ =
+    //         tokio::time::timeout(backend.chain_config().block_time + std::time::Duration::from_secs(2), task_handle)
+    //             .await;
+
+    //     let pending_block = backend.get_block(&DbBlockId::Pending).unwrap().unwrap();
+
+    //     assert!(pending_block.inner.transactions.is_empty());
+    //     assert_eq!(backend.get_latest_block_n().unwrap().unwrap(), 0);
+    // }
 }
